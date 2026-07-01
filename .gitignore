@@ -1,0 +1,21 @@
+# Obsidian Vault .gitignore
+
+# 工作区配置（每台电脑不同，不同步）
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/app.json
+.obsidian/appearance.json
+.obsidian/hotkeys.json
+
+# 插件数据（每台设备可能不同）
+.obsidian/plugins/obsidian-git/data.json
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# 缓存
+.obsidian/cache/
+
+# 大文件（Excalidraw 的二进制图片等）
+*.excalidraw.png

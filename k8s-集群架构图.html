@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>K8s 集群 + 中间件 架构图</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem;
+      color: white;
+    }
+    .container { max-width: 1300px; margin: 0 auto; }
+    .header { margin-bottom: 2rem; }
+    .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+    .pulse-dot { width: 12px; height: 12px; background: #22d3ee; border-radius: 50%; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #94a3b8; font-size: 0.875rem; margin-left: 1.75rem; }
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+    svg { width: 100%; min-width: 1100px; display: block; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 2rem; }
+    .card { background: rgba(15, 23, 42, 0.5); border-radius: 0.75rem; border: 1px solid #1e293b; padding: 1.25rem; }
+    .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald {background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.amber { background: #fbbf24; }
+    .card-dot.orange { background: #fb923c; }
+    .card h3 { font-size: 0.875rem; font-weight: 600; }
+    .card ul { list-style: none; color: #94a3b8; font-size: 0.75rem; }
+    .card li { margin-bottom: 0.375rem; }
+    .footer { text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>K8s 集群 + 中间件 架构拓扑</h1>
+      </div>
+      <p class="subtitle">3 台物理机 · 2 个 K8s 工作节点 · 1 个中间件节点</p>
+    </div>
+
+    <!-- Main Diagram -->
+    <div class="diagram-container">
+      <svg viewBox="0 0 1200 820">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+          </marker>
+          <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
+          </marker>
+          <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399" />
+          </marker>
+          <marker id="arrow-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa" />
+          </marker>
+          <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <!-- Background Grid -->
+        <rect width="1200" height="820" fill="url(#grid)" />
+
+        <!-- ============================================================
+             EXTERNAL LAYER
+             ============================================================ -->
+
+        <!-- Users / Clients -->
+        <rect x="460" y="30" width="280" height="55" rx="8" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="600" y="52" fill="white" font-size="12" font-weight="600" text-anchor="middle">用户 / 客户端</text>
+        <text x="600" y="70" fill="#94a3b8" font-size="9" text-anchor="middle">Browser · Mobile App · API Client</text>
+
+        <!-- Arrow: Users → Ingress -->
+        <line x1="600" y1="85" x2="600" y2="108" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+        <text x="615" y="100" fill="#94a3b8" font-size="8">HTTPS</text>
+
+        <!-- Ingress / Load Balancer -->
+        <rect x="440" y="115" width="320" height="48" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="600" y="136" fill="white" font-size="12" font-weight="600" text-anchor="middle">Ingress / Nginx · Load Balancer</text>
+        <text x="600" y="152" fill="#94a3b8" font-size="9" text-anchor="middle">:80 :443 → Service (ClusterIP/NodePort)</text>
+
+        <!-- ============================================================
+             ARROWS: Ingress → K8s Nodes
+             ============================================================ -->
+        <!-- Left arrow to Node-1 -->
+        <path d="M 520 163 L 520 175 Q 520 185 510 185 L 210 185 Q 200 185 200 195" fill="none" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+        <!-- Right arrow to Node-2 -->
+        <path d="M 680 163 L 680 175 Q 680 185 690 185 L 990 185 Q 1000 185 1000 195" fill="none" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+
+        <!-- ============================================================
+             PHYSICAL MACHINE BOUNDARIES
+             ============================================================ -->
+
+        <!-- === Machine 1: K8s Node-1 === -->
+        <rect x="30" y="200" width="360" height="380" rx="10" fill="rgba(56, 189, 248, 0.03)" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <!-- Machine label -->
+        <rect x="30" y="200" width="360" height="30" rx="10" fill="rgba(56, 189, 248, 0.12)"/>
+        <rect x="30" y="210" width="360" height="20" fill="rgba(56, 189, 248, 0.12)"/>
+        <text x="50" y="219" fill="#38bdf8" font-size="10" font-weight="600">🖥 K8s 节点-1</text>
+        <text x="290" y="219" fill="#64748b" font-size="8" text-anchor="end">4C8G · Ubuntu 22.04</text>
+
+        <!-- K8s Node-1 Internals -->
+        <!-- Pod A: app-gateway -->
+        <rect x="50" y="248" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="125" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-gateway</text>
+        <text x="125" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">网关 · 路由 · 限流</text>
+        <text x="125" y="299" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 3 replicas</text>
+
+        <!-- Pod B: app-order -->
+        <rect x="220" y="248" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="295" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-order</text>
+        <text x="295" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">订单服务</text>
+        <text x="295" y="299" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 3 replicas</text>
+
+        <!-- Pod C: app-user -->
+        <rect x="50" y="320" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="125" y="342" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-user</text>
+        <text x="125" y="358" fill="#94a3b8" font-size="8" text-anchor="middle">用户 · 认证 · 权限</text>
+        <text x="125" y="371" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 2 replicas</text>
+
+        <!-- Pod D: app-payment -->
+        <rect x="220" y="320" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="295" y="342" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-payment</text>
+        <text x="295" y="358" fill="#94a3b8" font-size="8" text-anchor="middle">支付 · 对账</text>
+        <text x="295" y="371" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 2 replicas</text>
+
+        <!-- Kubelet / kube-proxy bar -->
+        <rect x="50" y="395" width="320" height="22" rx="4" fill="rgba(56, 189, 248, 0.1)" stroke="#38bdf8" stroke-width="0.8" stroke-dasharray="2,2"/>
+        <text x="210" y="410" fill="#64748b" font-size="8" text-anchor="middle">kubelet · kube-proxy · Container Runtime (containerd)</text>
+
+        <!-- K8s label badge -->
+        <rect x="140" y="430" width="140" height="22" rx="4" fill="rgba(6, 78, 59, 0.15)" stroke="#34d399" stroke-width="0.8"/>
+        <text x="210" y="445" fill="#34d399" font-size="9" font-weight="600" text-anchor="middle">☸ K8s Worker Node</text>
+
+        <!-- Calico / CNI -->
+        <rect x="50" y="470" width="320" height="22" rx="4" fill="rgba(251, 191, 36, 0.08)" stroke="#fbbf24" stroke-width="0.8" stroke-dasharray="2,2"/>
+        <text x="210" y="485" fill="#64748b" font-size="8" text-anchor="middle">CNI (Calico) · CoreDNS · Metrics Server</text>
+
+        <!-- Pod CIDR -->
+        <text x="210" y="565" fill="#475569" font-size="8" text-anchor="middle">Pod CIDR: 10.244.1.0/24</text>
+
+        <!-- === Machine 2: 中间件节点 === -->
+        <rect x="420" y="200" width="360" height="380" rx="10" fill="rgba(245, 158, 11, 0.03)" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <!-- Machine label -->
+        <rect x="420" y="200" width="360" height="30" rx="10" fill="rgba(245, 158, 11, 0.12)"/>
+        <rect x="420" y="210" width="360" height="20" fill="rgba(245, 158, 11, 0.12)"/>
+        <text x="440" y="219" fill="#f59e0b" font-size="10" font-weight="600">🖥 中间件节点</text>
+        <text x="700" y="219" fill="#64748b" font-size="8" text-anchor="end">8C16G · Ubuntu 22.04</text>
+
+        <!-- MySQL -->
+        <rect x="442" y="248" width="152" height="65" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="518" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">MySQL</text>
+        <text x="518" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">关系型数据库 · :3306</text>
+        <text x="518" y="302" fill="#a78bfa" font-size="7" text-anchor="middle">主从复制 · InnoDB</text>
+
+        <!-- Redis -->
+        <rect x="610" y="248" width="152" height="65" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="686" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">Redis</text>
+        <text x="686" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">缓存 / 内存数据库 · :6379</text>
+        <text x="686" y="302" fill="#a78bfa" font-size="7" text-anchor="middle">Sentinel · Cluster</text>
+
+        <!-- RabbitMQ -->
+        <rect x="442" y="328" width="152" height="65" rx="6" fill="rgba(251, 146, 60, 0.35)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="518" y="350" fill="white" font-size="11" font-weight="600" text-anchor="middle">RabbitMQ</text>
+        <text x="518" y="366" fill="#94a3b8" font-size="8" text-anchor="middle">消息队列 · :5672</text>
+        <text x="518" y="382" fill="#fb923c" font-size="7" text-anchor="middle">Exchange · Queue · DLX</text>
+
+        <!-- MongoDB -->
+        <rect x="610" y="328" width="152" height="65" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="686" y="350" fill="white" font-size="11" font-weight="600" text-anchor="middle">MongoDB</text>
+        <text x="686" y="366" fill="#94a3b8" font-size="8" text-anchor="middle">文档数据库 · :27017</text>
+        <text x="686" y="382" fill="#a78bfa" font-size="7" text-anchor="middle">Replica Set · Sharding</text>
+
+        <!-- Nacos -->
+        <rect x="475" y="410" width="250" height="65" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="600" y="432" fill="white" font-size="11" font-weight="600" text-anchor="middle">Nacos</text>
+        <text x="600" y="448" fill="#94a3b8" font-size="8" text-anchor="middle">服务注册 · 配置中心 · :8848</text>
+        <text x="600" y="464" fill="#fbbf24" font-size="7" text-anchor="middle">命名空间 · 分组 · 健康检查</text>
+
+        <!-- Middleware notes -->
+        <text x="600" y="565" fill="#475569" font-size="8" text-anchor="middle">所有中间件通过内网 IP 直连，K8s Service/Endpoints 穿透</text>
+
+        <!-- === Machine 3: K8s Node-2 === -->
+        <rect x="810" y="200" width="360" height="380" rx="10" fill="rgba(56, 189, 248, 0.03)" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <!-- Machine label -->
+        <rect x="810" y="200" width="360" height="30" rx="10" fill="rgba(56, 189, 248, 0.12)"/>
+        <rect x="810" y="210" width="360" height="20" fill="rgba(56, 189, 248, 0.12)"/>
+        <text x="830" y="219" fill="#38bdf8" font-size="10" font-weight="600">🖥 K8s 节点-2</text>
+        <text x="1070" y="219" fill="#64748b" font-size="8" text-anchor="end">4C8G · Ubuntu 22.04</text>
+
+        <!-- Pod E: app-product -->
+        <rect x="830" y="248" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="905" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-product</text>
+        <text x="905" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">商品服务</text>
+        <text x="905" y="299" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 3 replicas</text>
+
+        <!-- Pod F: app-cart -->
+        <rect x="1000" y="248" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="1075" y="270" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-cart</text>
+        <text x="1075" y="286" fill="#94a3b8" font-size="8" text-anchor="middle">购物车服务</text>
+        <text x="1075" y="299" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 2 replicas</text>
+
+        <!-- Pod G: app-notify -->
+        <rect x="830" y="320" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="905" y="342" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-notify</text>
+        <text x="905" y="358" fill="#94a3b8" font-size="8" text-anchor="middle">通知 · 推送</text>
+        <text x="905" y="371" fill="#34d399" font-size="7" text-anchor="middle">Deployment / 2 replicas</text>
+
+        <!-- Pod H: app-log -->
+        <rect x="1000" y="320" width="150" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="1075" y="342" fill="white" font-size="11" font-weight="600" text-anchor="middle">app-log</text>
+        <text x="1075" y="358" fill="#94a3b8" font-size="8" text-anchor="middle">日志 · 审计</text>
+        <text x="1075" y="371" fill="#34d399" font-size="7" text-anchor="middle">DaemonSet / Node</text>
+
+        <!-- Kubelet bar -->
+        <rect x="830" y="395" width="320" height="22" rx="4" fill="rgba(56, 189, 248, 0.1)" stroke="#38bdf8" stroke-width="0.8" stroke-dasharray="2,2"/>
+        <text x="990" y="410" fill="#64748b" font-size="8" text-anchor="middle">kubelet · kube-proxy · Container Runtime (containerd)</text>
+
+        <!-- K8s label badge -->
+        <rect x="920" y="430" width="140" height="22" rx="4" fill="rgba(6, 78, 59, 0.15)" stroke="#34d399" stroke-width="0.8"/>
+        <text x="990" y="445" fill="#34d399" font-size="9" font-weight="600" text-anchor="middle">☸ K8s Worker Node</text>
+
+        <!-- Calico / CNI -->
+        <rect x="830" y="470" width="320" height="22" rx="4" fill="rgba(251, 191, 36, 0.08)" stroke="#fbbf24" stroke-width="0.8" stroke-dasharray="2,2"/>
+        <text x="990" y="485" fill="#64748b" font-size="8" text-anchor="middle">CNI (Calico) · CoreDNS · Metrics Server</text>
+
+        <!-- Pod CIDR -->
+        <text x="990" y="565" fill="#475569" font-size="8" text-anchor="middle">Pod CIDR: 10.244.2.0/24</text>
+
+        <!-- ============================================================
+             ARROWS: K8s Nodes → Middleware
+             ============================================================ -->
+
+        <!-- Node-1 → MySQL (JDBC/读写) -->
+        <line x1="390" y1="268" x2="440" y2="268" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+        <text x="410" y="260" fill="#a78bfa" font-size="7">JDBC</text>
+
+        <!-- Node-1 → Redis (缓存) -->
+        <line x1="390" y1="285" x2="440" y2="283" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+        <text x="408" y="295" fill="#a78bfa" font-size="7">Cache</text>
+
+        <!-- Node-1 → RabbitMQ (消息) -->
+        <line x1="390" y1="350" x2="440" y2="355" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+        <text x="410" y="344" fill="#fb923c" font-size="7">Publish</text>
+
+        <!-- Node-1 → Nacos -->
+        <line x1="390" y1="430" x2="473" y2="435" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="420" y="424" fill="#94a3b8" font-size="7">注册</text>
+
+        <!-- Node-2 → MySQL -->
+        <line x1="810" y1="268" x2="764" y2="268" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+        <text x="780" y="260" fill="#a78bfa" font-size="7">JDBC</text>
+
+        <!-- Node-2 → MongoDB -->
+        <line x1="810" y1="350" x2="764" y2="357" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+        <text x="780" y="345" fill="#a78bfa" font-size="7">Query</text>
+
+        <!-- Node-2 → RabbitMQ (消费) -->
+        <line x1="810" y1="370" x2="764" y2="368" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+        <text x="780" y="380" fill="#fb923c" font-size="7">Consume</text>
+
+        <!-- Node-2 → Nacos -->
+        <line x1="810" y1="455" x2="727" y2="445" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="775" y="438" fill="#94a3b8" font-size="7">发现</text>
+
+        <!-- ============================================================
+             LEGEND
+             ============================================================ -->
+        <rect x="60" y="610" width="1080" height="145" rx="8" fill="rgba(15, 23, 42, 0.6)" stroke="#1e293b" stroke-width="1"/>
+        <text x="80" y="632" fill="white" font-size="10" font-weight="600">图例</text>
+
+        <!-- Row 1 -->
+        <rect x="80" y="648" width="18" height="10" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="104" y="656" fill="#94a3b8" font-size="8">K8s 应用 Pod (Backend)</text>
+
+        <rect x="300" y="648" width="18" height="10" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="324" y="656" fill="#94a3b8" font-size="8">数据库 / 缓存 (Database)</text>
+
+        <rect x="520" y="648" width="18" height="10" rx="2" fill="rgba(251, 146, 60, 0.35)" stroke="#fb923c" stroke-width="1"/>
+        <text x="544" y="656" fill="#94a3b8" font-size="8">消息队列 (Message Bus)</text>
+
+        <rect x="740" y="648" width="18" height="10" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="764" y="656" fill="#94a3b8" font-size="8">服务治理 / 配置 (Cloud)</text>
+
+        <rect x="960" y="648" width="18" height="10" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="984" y="656" fill="#94a3b8" font-size="8">入口 / 网关 (Frontend)</text>
+
+        <!-- Row 2 -->
+        <rect x="80" y="670" width="18" height="10" rx="2" fill="rgba(56, 189, 248, 0.08)" stroke="#38bdf8" stroke-width="1" stroke-dasharray="4,2"/>
+        <text x="104" y="678" fill="#94a3b8" font-size="8">K8s 物理节点</text>
+
+        <rect x="300" y="670" width="18" height="10" rx="2" fill="rgba(245, 158, 11, 0.08)" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+        <text x="324" y="678" fill="#94a3b8" font-size="8">中间件物理节点</text>
+
+        <rect x="520" y="670" width="18" height="10" rx="2" fill="transparent" stroke="#64748b" stroke-width="1"/>
+        <text x="544" y="678" fill="#94a3b8" font-size="8">外部客户端</text>
+
+        <!-- Connection types -->
+        <line x1="740" y1="675" x2="770" y2="675" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+        <text x="778" y="678" fill="#94a3b8" font-size="8">数据连接</text>
+
+        <line x1="880" y1="675" x2="910" y2="675" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+        <text x="918" y="678" fill="#94a3b8" font-size="8">消息通信</text>
+
+        <line x1="1000" y1="675" x2="1030" y2="675" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+        <text x="1038" y="678" fill="#94a3b8" font-size="8">流量入口</text>
+
+        <!-- Row 3: Notes -->
+        <text x="80" y="702" fill="#475569" font-size="8">
+          * K8s 节点通过 Calico CNI 互通 Pod 网络，通过 Service + Endpoints 映射到中间件节点内网 IP。Nacos 提供服务注册发现，所有微服务启动时向 Nacos 注册，通过服务名调用。
+        </text>
+
+        <!-- K8s Control Plane note (separate, not on these 3 machines) -->
+        <text x="80" y="720" fill="#475569" font-size="8">
+          * K8s Control Plane（API Server / Scheduler / Controller Manager / etcd）不在本图中，由托管服务或独立 Master 节点承载。
+        </text>
+      </svg>
+    </div>
+
+    <!-- Info Cards -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>K8s 工作节点 (×2)</h3>
+        </div>
+        <ul>
+          <li>• 运行 8 个微服务 Pod（每节点 4 个）</li>
+          <li>• kubelet + kube-proxy + containerd</li>
+          <li>• Calico CNI 组网，Pod CIDR 互通</li>
+          <li>• CoreDNS 集群内 DNS 解析</li>
+          <li>• Deployment 管理副本，滚动更新</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot amber"></div>
+          <h3>中间件节点</h3>
+        </div>
+        <ul>
+          <li>• MySQL — 关系型存储，主从读写分离</li>
+          <li>• Redis — 分布式缓存 / 会话 / 锁</li>
+          <li>• RabbitMQ — 异步消息解耦</li>
+          <li>• MongoDB — 文档存储 / 日志归档</li>
+          <li>• Nacos — 服务注册发现 & 配置管理</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot cyan"></div>
+          <h3>流量路径</h3>
+        </div>
+        <ul>
+          <li>• 客户端 → Ingress (Nginx) :80/:443</li>
+          <li>• Ingress → K8s Service → Pod</li>
+          <li>• Pod → Nacos (服务发现)</li>
+          <li>• Pod → MySQL / Redis / RMQ / Mongo</li>
+          <li>• 中间件通过内网 IP 直连，不走 Ingress</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <p class="footer">
+      K8s 集群 + 中间件 架构拓扑 · 3 台物理机部署 · Generated by Hermes Agent
+    </p>
+  </div>
+</body>
+</html>

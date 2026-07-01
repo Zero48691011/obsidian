@@ -1,0 +1,548 @@
+# ============================================================
+# GitLab CI/CD Pipeline — GitLab CI + ArgoCD 完整部署流程
+# 
+# 流程:
+#   Lint/Test → Build Docker Image → Push Registry → 
+#   Update K8s Manifest → Record to DB → 
+#   ArgoCD Sync → Wait Healthy → Record to DB
+# ============================================================
+
+stages:
+  - validate
+  - build
+  - deploy-staging
+  - approve
+  - deploy-prod
+
+# ============================================================
+# 全局变量
+# ============================================================
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  IMAGE_REGISTRY: harbor.example.com
+  IMAGE_NAMESPACE: app
+  APP_NAME: ${CI_PROJECT_NAME}
+
+  # K8s Manifest 仓库（GitOps 仓库，与业务代码分离）
+  GITOPS_REPO: git@gitlab.example.com:ops/k8s-manifests.git
+  GITOPS_BRANCH: main
+
+  # Deploy Recorder API 地址
+  RECORDER_API_URL: https://deploy-recorder.internal/api/v1
+
+  # 环境定义
+  STAGING_NAMESPACE: staging
+  PROD_NAMESPACE: production
+
+# ============================================================
+# 通用模板
+# ============================================================
+
+# 基础容器镜像
+.base_image: &base_image
+  image: alpine:3.19
+
+.docker_image: &docker_image
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+
+.recorder_image: &recorder_image
+  image: curlimages/curl:8.2.1
+
+# 记录 Pipeline 阶段到数据库
+.record_stage: &record_stage
+  before_script:
+    - |
+      record_stage() {
+        local stage_name="$1"
+        local job_name="$2"
+        local status="$3"
+        curl -s -X POST "${RECORDER_API_URL}/stages" \
+          -H "Content-Type: application/json" \
+          -H "X-API-Key: ${RECORDER_API_KEY}" \
+          -d "{
+            \"pipeline_id\": ${PIPELINE_DB_ID},
+            \"stage_name\": \"${stage_name}\",
+            \"job_name\": \"${job_name}\",
+            \"status\": \"${status}\",
+            \"gitlab_pipeline_id\": ${CI_PIPELINE_ID}
+          }"
+      }
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        record_stage "${CI_JOB_STAGE}" "${CI_JOB_NAME}" "failed"
+      else
+        record_stage "${CI_JOB_STAGE}" "${CI_JOB_NAME}" "success"
+      fi
+
+# 获取镜像全名
+.get_image_full: &get_image_full
+  - export IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${APP_NAME}:${CI_COMMIT_SHORT_SHA}"
+  - export IMAGE_LATEST="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${APP_NAME}:latest"
+
+# ============================================================
+# Stage 1: Validate (代码质量 / 安全扫描)
+# ============================================================
+
+lint:
+  stage: validate
+  <<: *base_image
+  <<: *record_stage
+  before_script:
+    - apk add --no-cache nodejs npm shellcheck
+  script:
+    - |
+      # 注册 Pipeline 到数据库
+      PIPELINE_DB_ID=$(curl -s -X POST "${RECORDER_API_URL}/pipelines" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"gitlab_pipeline_id\": ${CI_PIPELINE_ID},
+          \"gitlab_pipeline_url\": \"${CI_PIPELINE_URL}\",
+          \"ref\": \"${CI_COMMIT_REF_NAME}\",
+          \"commit_sha\": \"${CI_COMMIT_SHA}\",
+          \"commit_message\": \"${CI_COMMIT_MESSAGE}\",
+          \"triggered_by\": \"${GITLAB_USER_LOGIN}\",
+          \"status\": \"running\"
+        }" | jq -r '.id')
+      export PIPELINE_DB_ID
+      echo "Pipeline DB ID: ${PIPELINE_DB_ID}"
+
+      # 代码检查
+      echo "=== Running ESLint ==="
+      npx eslint src/ --ext .js,.ts 2>&1 || true
+
+      echo "=== Running ShellCheck ==="
+      find . -name "*.sh" -exec shellcheck {} \; 2>&1 || true
+
+      echo "=== Running YAML lint ==="
+      find . -name "*.yml" -o -name "*.yaml" | while read f; do
+        python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>&1 || echo "YAML parse error in $f"
+      done
+
+unit-test:
+  stage: validate
+  <<: *base_image
+  <<: *record_stage
+  before_script:
+    - apk add --no-cache nodejs npm
+  script:
+    - npm ci
+    - npm run test -- --coverage --reporter=junit
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+    paths:
+      - coverage/
+
+# ============================================================
+# Stage 2: Build (Docker 镜像构建 & 推送)
+# ============================================================
+
+build-image:
+  stage: build
+  <<: *docker_image
+  <<: *record_stage
+  script:
+    - *get_image_full
+    - |
+      # 记录构建开始
+      BUILD_ID=$(curl -s -X POST "${RECORDER_API_URL}/builds" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"pipeline_id\": ${PIPELINE_DB_ID},
+          \"image_name\": \"${IMAGE_FULL}\",
+          \"image_tag\": \"${CI_COMMIT_SHORT_SHA}\",
+          \"dockerfile_path\": \"Dockerfile\",
+          \"status\": \"running\"
+        }" | jq -r '.id')
+      export BUILD_ID
+
+      # Docker 登录
+      echo "${HARBOR_PASSWORD}" | docker login ${IMAGE_REGISTRY} -u ${HARBOR_USER} --password-stdin
+
+      # 构建镜像
+      docker build \
+        --build-arg CI_COMMIT_SHA=${CI_COMMIT_SHA} \
+        --build-arg CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME} \
+        -t ${IMAGE_FULL} \
+        -t ${IMAGE_LATEST} \
+        -f Dockerfile .
+
+      # 推送镜像
+      docker push ${IMAGE_FULL}
+      docker push ${IMAGE_LATEST}
+
+      # 获取镜像 digest
+      IMAGE_SHA256=$(docker inspect ${IMAGE_FULL} --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+
+      # 更新构建状态
+      curl -s -X PATCH "${RECORDER_API_URL}/builds/${BUILD_ID}" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"status\": \"success\",
+          \"image_sha256\": \"${IMAGE_SHA256}\"
+        }"
+
+      echo "Image built: ${IMAGE_FULL}"
+      echo "Image SHA256: ${IMAGE_SHA256}"
+
+  artifacts:
+    paths:
+      - k8s/
+
+# 安全扫描（可选）
+image-scan:
+  stage: build
+  <<: *base_image
+  allow_failure: true
+  script:
+    - apk add --no-cache trivy
+    - trivy image --severity HIGH,CRITICAL --no-progress ${IMAGE_FULL} || true
+
+# ============================================================
+# Stage 3: Deploy to Staging
+# ============================================================
+
+deploy-staging:
+  stage: deploy-staging
+  <<: *recorder_image
+  <<: *record_stage
+  before_script:
+    - *get_image_full
+    - apk add --no-cache git openssh-client yq
+    - git config --global user.email "gitlab-ci@example.com"
+    - git config --global user.name "GitLab CI"
+  script:
+    - |
+      # 1. 记录部署开始
+      DEPLOY_ID=$(curl -s -X POST "${RECORDER_API_URL}/deployments" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"pipeline_id\": ${PIPELINE_DB_ID},
+          \"build_id\": ${BUILD_ID},
+          \"environment\": \"staging\",
+          \"strategy\": \"rolling\",
+          \"image_name\": \"${IMAGE_FULL}\",
+          \"image_tag\": \"${CI_COMMIT_SHORT_SHA}\",
+          \"git_commit_sha\": \"${CI_COMMIT_SHA}\",
+          \"git_ref\": \"${CI_COMMIT_REF_NAME}\",
+          \"status\": \"pending\"
+        }" | jq -r '.id')
+      export DEPLOY_ID
+
+      # 2. 更新 GitOps 仓库中的镜像 tag
+      mkdir -p /tmp/gitops
+      git clone --depth 1 -b ${GITOPS_BRANCH} ${GITOPS_REPO} /tmp/gitops
+      cd /tmp/gitops
+
+      # 使用 yq 更新 Kustomize / Helm values
+      yq -i ".images[0].newTag = \"${CI_COMMIT_SHORT_SHA}\"" \
+        apps/${APP_NAME}/overlays/staging/kustomization.yaml
+
+      # 提交变更
+      git add apps/${APP_NAME}/overlays/staging/kustomization.yaml
+      git commit -m "ci: update ${APP_NAME} staging image to ${CI_COMMIT_SHORT_SHA} [${CI_COMMIT_REF_NAME}]"
+      git push origin ${GITOPS_BRANCH}
+
+      # 3. 触发 ArgoCD 同步
+      ARGOCD_SYNC_RESULT=$(curl -s -X POST "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-staging/sync" \
+        -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "revision": "'${CI_COMMIT_SHA}'",
+          "prune": true,
+          "dryRun": false
+        }')
+
+      echo "ArgoCD sync triggered: ${ARGOCD_SYNC_RESULT}"
+
+      # 4. 记录审计日志
+      curl -s -X POST "${RECORDER_API_URL}/audit" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"deployment_id\": ${DEPLOY_ID},
+          \"pipeline_id\": ${PIPELINE_DB_ID},
+          \"action\": \"argocd_sync_staging\",
+          \"actor\": \"${GITLAB_USER_LOGIN}\",
+          \"source\": \"gitlab_ci\",
+          \"details\": {
+            \"app\": \"${APP_NAME}-staging\",
+            \"image\": \"${IMAGE_FULL}\",
+            \"commit\": \"${CI_COMMIT_SHA}\"
+          }
+        }"
+
+      # 5. 等待 ArgoCD 同步完成
+      echo "Waiting for ArgoCD sync to complete..."
+      for i in $(seq 1 60); do
+        SYNC_STATUS=$(curl -s "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-staging" \
+          -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+          | jq -r '.status.sync.status')
+
+        HEALTH_STATUS=$(curl -s "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-staging" \
+          -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+          | jq -r '.status.health.status')
+
+        echo "[${i}/60] Sync: ${SYNC_STATUS}, Health: ${HEALTH_STATUS}"
+
+        if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+          echo "✓ Deployment healthy!"
+
+          # 更新部署状态
+          curl -s -X PATCH "${RECORDER_API_URL}/deployments/${DEPLOY_ID}" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${RECORDER_API_KEY}" \
+            -d '{"status": "healthy"}'
+
+          curl -s -X POST "${RECORDER_API_URL}/audit" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${RECORDER_API_KEY}" \
+            -d "{
+              \"project_id\": ${PROJECT_DB_ID},
+              \"deployment_id\": ${DEPLOY_ID},
+              \"action\": \"deploy_success_staging\",
+              \"actor\": \"gitlab_ci\",
+              \"source\": \"gitlab_ci\"
+            }"
+
+          exit 0
+        fi
+        sleep 10
+      done
+
+      # 超时处理
+      echo "✗ Deployment timeout!"
+      curl -s -X PATCH "${RECORDER_API_URL}/deployments/${DEPLOY_ID}" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d '{"status": "degraded"}'
+      exit 1
+
+  environment:
+    name: staging
+    url: https://staging.${APP_NAME}.example.com
+
+# ============================================================
+# Stage 4: Manual Approval
+# ============================================================
+
+approve-prod:
+  stage: approve
+  <<: *recorder_image
+  when: manual
+  script:
+    - |
+      curl -s -X POST "${RECORDER_API_URL}/audit" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"pipeline_id\": ${PIPELINE_DB_ID},
+          \"action\": \"manual_approve_prod\",
+          \"actor\": \"${GITLAB_USER_LOGIN}\",
+          \"source\": \"manual\",
+          \"details\": {
+            \"approved_by\": \"${GITLAB_USER_LOGIN}\",
+            \"approved_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+          }
+        }"
+      echo "Production deployment approved by ${GITLAB_USER_LOGIN}"
+
+# ============================================================
+# Stage 5: Deploy to Production (Blue-Green)
+# ============================================================
+
+deploy-prod:
+  stage: deploy-prod
+  <<: *recorder_image
+  <<: *record_stage
+  before_script:
+    - *get_image_full
+    - apk add --no-cache git openssh-client yq curl
+  script:
+    - |
+      # 1. 记录部署开始
+      DEPLOY_PROD_ID=$(curl -s -X POST "${RECORDER_API_URL}/deployments" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"pipeline_id\": ${PIPELINE_DB_ID},
+          \"build_id\": ${BUILD_ID},
+          \"environment\": \"production\",
+          \"strategy\": \"blue-green\",
+          \"image_name\": \"${IMAGE_FULL}\",
+          \"image_tag\": \"${CI_COMMIT_SHORT_SHA}\",
+          \"git_commit_sha\": \"${CI_COMMIT_SHA}\",
+          \"git_ref\": \"${CI_COMMIT_REF_NAME}\",
+          \"status\": \"pending\"
+        }" | jq -r '.id')
+      export DEPLOY_PROD_ID
+
+      # 2. 更新 GitOps 仓库
+      mkdir -p /tmp/gitops-prod
+      git clone --depth 1 -b ${GITOPS_BRANCH} ${GITOPS_REPO} /tmp/gitops-prod
+      cd /tmp/gitops-prod
+
+      yq -i ".images[0].newTag = \"${CI_COMMIT_SHORT_SHA}\"" \
+        apps/${APP_NAME}/overlays/production/kustomization.yaml
+
+      git add apps/${APP_NAME}/overlays/production/kustomization.yaml
+      git commit -m "ci: update ${APP_NAME} production image to ${CI_COMMIT_SHORT_SHA} [${CI_COMMIT_REF_NAME}]"
+      git push origin ${GITOPS_BRANCH}
+
+      # 3. 触发 ArgoCD 同步
+      curl -s -X POST "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-production/sync" \
+        -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "revision": "'${CI_COMMIT_SHA}'",
+          "prune": false,
+          "dryRun": false
+        }'
+
+      # 4. 等待同步完成
+      echo "Waiting for production deployment..."
+      for i in $(seq 1 120); do
+        RESPONSE=$(curl -s "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-production" \
+          -H "Authorization: Bearer ${ARGOCD_TOKEN}")
+
+        SYNC_STATUS=$(echo "${RESPONSE}" | jq -r '.status.sync.status')
+        HEALTH_STATUS=$(echo "${RESPONSE}" | jq -r '.status.health.status')
+
+        echo "[${i}/120] Sync: ${SYNC_STATUS}, Health: ${HEALTH_STATUS}"
+
+        if [ "${SYNC_STATUS}" = "Synced" ] && [ "${HEALTH_STATUS}" = "Healthy" ]; then
+          echo "✓ Production deployment successful!"
+
+          # 更新部署状态
+          curl -s -X PATCH "${RECORDER_API_URL}/deployments/${DEPLOY_PROD_ID}" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${RECORDER_API_KEY}" \
+            -d '{"status": "healthy"}'
+
+          curl -s -X POST "${RECORDER_API_URL}/audit" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${RECORDER_API_KEY}" \
+            -d "{
+              \"project_id\": ${PROJECT_DB_ID},
+              \"deployment_id\": ${DEPLOY_PROD_ID},
+              \"action\": \"deploy_success_prod\",
+              \"actor\": \"${GITLAB_USER_LOGIN}\",
+              \"source\": \"gitlab_ci\"
+            }"
+
+          exit 0
+        fi
+        sleep 10
+      done
+
+      # 超时 → 触发回滚
+      echo "✗ Deployment timeout! Rolling back..."
+      ROLLBACK_IMAGE=$(curl -s "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-production" \
+        -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+        | jq -r '.status.sync.revision')
+
+      curl -s -X POST "${RECORDER_API_URL}/deployments/rollback" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"deployment_id\": ${DEPLOY_PROD_ID},
+          \"rollback_to_revision\": \"${ROLLBACK_IMAGE}\",
+          \"reason\": \"health_check_timeout\"
+        }"
+
+      exit 1
+
+  environment:
+    name: production
+    url: https://${APP_NAME}.example.com
+
+# ============================================================
+# 回滚 Job（手动触发）
+# ============================================================
+
+rollback-prod:
+  stage: deploy-prod
+  <<: *recorder_image
+  when: manual
+  script:
+    - |
+      echo "Rolling back production deployment..."
+
+      # 获取上一个健康版本
+      PREV_DEPLOY=$(curl -s "${RECORDER_API_URL}/deployments/latest-healthy?project_id=${PROJECT_DB_ID}&environment=production" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        | jq -r '.image_tag')
+
+      # 回滚 GitOps 仓库
+      mkdir -p /tmp/gitops-rollback
+      git clone --depth 1 -b ${GITOPS_BRANCH} ${GITOPS_REPO} /tmp/gitops-rollback
+      cd /tmp/gitops-rollback
+
+      yq -i ".images[0].newTag = \"${PREV_DEPLOY}\"" \
+        apps/${APP_NAME}/overlays/production/kustomization.yaml
+
+      git add apps/${APP_NAME}/overlays/production/kustomization.yaml
+      git commit -m "fix: rollback ${APP_NAME} production to ${PREV_DEPLOY}"
+      git push origin ${GITOPS_BRANCH}
+
+      # 触发 ArgoCD 同步
+      curl -s -X POST "${ARGOCD_SERVER}/api/v1/applications/${APP_NAME}-production/sync" \
+        -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d '{"prune": false, "dryRun": false}'
+
+      # 记录回滚
+      curl -s -X POST "${RECORDER_API_URL}/audit" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"project_id\": ${PROJECT_DB_ID},
+          \"action\": \"rollback_prod\",
+          \"actor\": \"${GITLAB_USER_LOGIN}\",
+          \"source\": \"manual\",
+          \"details\": {
+            \"from\": \"${CI_COMMIT_SHORT_SHA}\",
+            \"to\": \"${PREV_DEPLOY}\"
+          }
+        }"
+
+      echo "Rollback complete: ${PREV_DEPLOY}"
+
+# ============================================================
+# Pipeline 完成回调
+# ============================================================
+
+pipeline-complete:
+  stage: deploy-prod
+  <<: *recorder_image
+  when: always
+  script:
+    - |
+      STATUS="success"
+      if [ "${CI_JOB_STATUS}" = "failed" ]; then STATUS="failed"; fi
+      if [ "${CI_JOB_STATUS}" = "canceled" ]; then STATUS="canceled"; fi
+
+      curl -s -X PATCH "${RECORDER_API_URL}/pipelines/${PIPELINE_DB_ID}" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${RECORDER_API_KEY}" \
+        -d "{
+          \"status\": \"${STATUS}\",
+          \"finished_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+          \"duration_seconds\": ${CI_JOB_DURATION}
+        }"
+
+      echo "Pipeline ${CI_PIPELINE_ID} completed with status: ${STATUS}"

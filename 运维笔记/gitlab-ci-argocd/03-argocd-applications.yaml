@@ -1,0 +1,246 @@
+# ============================================================
+# ArgoCD Application 配置
+# 包含: Staging / Production Application + Notifications
+# ============================================================
+
+# --- ApplicationSet（推荐，自动发现应用）---
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ${APP_NAME}
+  namespace: argocd
+spec:
+  generators:
+    # 从 Git 目录结构自动发现环境
+    - git:
+        repoURL: git@gitlab.example.com:ops/k8s-manifests.git
+        revision: main
+        directories:
+          - path: apps/${APP_NAME}/overlays/*
+  template:
+    metadata:
+      name: '${APP_NAME}-{{path.basename}}'
+      namespace: argocd
+      labels:
+        app: ${APP_NAME}
+        environment: '{{path.basename}}'
+      # 标记: 同步事件需要通知 Deploy Recorder
+      annotations:
+        argocd.argoproj.io/sync-options: PrunePropagationPolicy=foreground
+        deploy-recorder.example.com/enabled: "true"
+        deploy-recorder.example.com/project-id: "${PROJECT_DB_ID}"
+    spec:
+      project: default
+      source:
+        repoURL: git@gitlab.example.com:ops/k8s-manifests.git
+        targetRevision: main
+        path: 'apps/${APP_NAME}/overlays/{{path.basename}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      # 忽略某些字段的差异（避免不必要的 OutOfSync）
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas  # HPA 管理的副本数
+
+# ============================================================
+# 单独 Application 定义（不使用 ApplicationSet 时）
+# ============================================================
+
+---
+# Staging Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP_NAME}-staging
+  namespace: argocd
+  annotations:
+    deploy-recorder.example.com/enabled: "true"
+    deploy-recorder.example.com/project-id: "${PROJECT_DB_ID}"
+spec:
+  project: default
+  source:
+    repoURL: git@gitlab.example.com:ops/k8s-manifests.git
+    targetRevision: main
+    path: apps/${APP_NAME}/overlays/staging
+    kustomize:
+      # 可选: 覆盖镜像 tag
+      images:
+        - harbor.example.com/app/${APP_NAME}:latest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+---
+# Production Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP_NAME}-production
+  namespace: argocd
+  annotations:
+    deploy-recorder.example.com/enabled: "true"
+    deploy-recorder.example.com/project-id: "${PROJECT_DB_ID}"
+spec:
+  project: default
+  source:
+    repoURL: git@gitlab.example.com:ops/k8s-manifests.git
+    targetRevision: main
+    path: apps/${APP_NAME}/overlays/production
+    kustomize:
+      images:
+        - harbor.example.com/app/${APP_NAME}:latest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true          # 生产环境也可 prune，GitOps 保证
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+# ============================================================
+# ArgoCD Notifications — 同步事件自动上报 Deploy Recorder
+# ============================================================
+
+# 注意: 需要安装 ArgoCD Notifications 组件
+# https://argocd-notifications.readthedocs.io/
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  # 自定义 Webhook 模板
+  template.deploy-recorder-sync: |
+    webhook:
+      deploy-recorder:
+        method: POST
+        url: https://deploy-recorder.internal/api/v1/argocd/webhook
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: X-API-Key
+            value: $recorder-api-key
+        body: |
+          {
+            "app_name": "{{.app.metadata.name}}",
+            "project_id": {{.app.metadata.annotations.deploy-recorder\\.example\\.com/project-id}},
+            "sync_status": "{{.app.status.sync.status}}",
+            "health_status": "{{.app.status.health.status}}",
+            "revision": "{{.app.status.sync.revision}}",
+            "operation_state_phase": "{{.app.status.operationState.phase}}",
+            "operation_state_message": "{{.app.status.operationState.message}}",
+            "timestamp": "{{.app.status.operationState.finishedAt}}"
+          }
+  
+  template.deploy-recorder-deployed: |
+    webhook:
+      deploy-recorder:
+        method: POST
+        url: https://deploy-recorder.internal/api/v1/argocd/webhook
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: X-API-Key
+            value: $recorder-api-key
+        body: |
+          {
+            "event": "health_checked",
+            "app_name": "{{.app.metadata.name}}",
+            "project_id": {{.app.metadata.annotations.deploy-recorder\\.example\\.com/project-id}},
+            "health_status": "{{.app.status.health.status}}",
+            "sync_status": "{{.app.status.sync.status}}",
+            "timestamp": "{{.app.status.operationState.finishedAt}}"
+          }
+
+  # 触发器: 同步完成时
+  trigger.on-sync-status-unknown: |
+    - when: app.status.sync.status != 'Unknown'
+      send: [deploy-recorder-sync]
+
+  # 触发器: 健康检查通过时
+  trigger.on-healthy: |
+    - when: app.status.health.status == 'Healthy'
+      send: [deploy-recorder-deployed]
+
+  # 触发器: 部署失败时
+  trigger.on-degraded: |
+    - when: app.status.health.status == 'Degraded'
+      send: [deploy-recorder-sync]
+
+  # 订阅: 所有带标注的应用
+  service.webhook.deploy-recorder: |
+    url: https://deploy-recorder.internal/api/v1/argocd/webhook
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: X-API-Key
+        value: $recorder-api-key
+
+  subscriptions: |
+    - recipients:
+        - deploy-recorder
+      triggers:
+        - on-sync-status-unknown
+        - on-healthy
+        - on-degraded
+
+# ============================================================
+# ArgoCD Resource Exclusion（资源排除，减少噪音）
+# ============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  resource.customizations: |
+    # 忽略某些字段的差异
+    apps/Deployment:
+      health.lua: |
+        hs = {}
+        hs.status = "Healthy"
+        return hs

@@ -1,0 +1,22 @@
+# ============================================================
+# Deploy Recorder Dockerfile
+# ============================================================
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安装依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY 04-deploy-recorder.py deploy_recorder.py
+
+# 健康检查
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000
+
+CMD ["python", "deploy_recorder.py"]
