@@ -357,3 +357,327 @@ curl http://localhost:$INGRESS_PORT/productpage
 | **适用场景** | 多语言微服务、需要灰度发布、需要服务间加密、需要统一流量治理 |
 | **不适用场景** | 小型项目（< 5 个服务）、单体应用、对性能极度敏感的场景 |
 | **与 K8s 关系** | K8s 管容器的「生老病死」，Istio 管服务间的「通信规则」— 互补，不是替代 |
+
+---
+
+## 十、生产实战：电商平台微服务案例
+
+### 场景设定
+
+某电商平台由 5 个微服务组成，部署在 K8s 集群中：
+
+```
+用户浏览器
+    │
+    ▼
+┌──────────┐     ┌──────────────┐     ┌──────────────┐
+│ frontend │────▶│ order-service│────▶│payment-service│
+│  (前端)   │     │   (订单服务)  │     │   (支付服务)   │
+└──────────┘     └──────┬───────┘     └──────────────┘
+                        │
+                        │         ┌──────────────────┐
+                        ├────────▶│inventory-service │
+                        │         │    (库存服务)      │
+                        │         └──────────────────┘
+                        │
+                        │         ┌──────────────────┐
+                        └────────▶│notification-svc  │
+                                  │    (通知服务)      │
+                                  └──────────────────┘
+```
+
+该集群已安装 Istio，所有 namespace 已开启 Sidecar 自动注入。
+
+---
+
+### 10.1 流量管理实战
+
+#### 场景 A：金丝雀发布 — order-service 上线 v2 版本
+
+**背景**：order-service 重构了订单查询逻辑，新版本 v2 需要逐步上线，避免一次性全量导致故障。
+
+**Step 1：定义版本子集（DestinationRule）**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: order-service-dest
+  namespace: prod
+spec:
+  host: order-service.prod.svc.cluster.local
+  subsets:
+  - name: v1
+    labels:
+      version: v1        # 当前稳定版本
+  - name: v2
+    labels:
+      version: v2        # 新版本
+```
+
+**Step 2：配置流量权重（VirtualService）**
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service-vs
+  namespace: prod
+spec:
+  hosts:
+  - order-service.prod.svc.cluster.local
+  http:
+  - match:
+    - headers:
+        x-canary:
+          exact: "true"         # 内部测试人员带此 Header 直接打到 v2
+    route:
+    - destination:
+        host: order-service.prod.svc.cluster.local
+        subset: v2
+  - route:                      # 普通用户流量
+    - destination:
+        host: order-service.prod.svc.cluster.local
+        subset: v1
+      weight: 95                # 95% → v1
+    - destination:
+        host: order-service.prod.svc.cluster.local
+        subset: v2
+      weight: 5                 # 5% → v2（金丝雀）
+```
+
+**上线过程**：观察 v2 的 5% 流量 → 无异常 → 改 weight 为 50:50 → 再观察 → 100% 切到 v2 → 下线 v1。
+
+**没有 Istio 时**：需要改代码/用 Nginx 多层代理切流量，出问题只能手动回滚。
+
+---
+
+#### 场景 B：超时 + 重试 — payment-service 调用第三方支付网关
+
+**背景**：payment-service 调用外部银行接口，偶尔超时，需要自动重试，但不能无限重试把下游打垮。
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: payment-service-vs
+  namespace: prod
+spec:
+  hosts:
+  - payment-service.prod.svc.cluster.local
+  http:
+  - route:
+    - destination:
+        host: payment-service.prod.svc.cluster.local
+        subset: v1
+    timeout: 5s          # 超过 5 秒直接返回超时，不让上游一直等
+    retries:
+      attempts: 2        # 最多重试 2 次
+      perTryTimeout: 3s  # 每次重试超时 3 秒
+      retryOn: 5xx,gateway-error,connect-failure  # 这些情况才重试
+```
+
+**效果**：用户下单时如果支付接口卡住，5 秒超时 + 最多 2 次重试，最坏情况 5 + 3 + 3 = 11 秒内一定有结果（成功或失败），前端不会一直转圈。
+
+**没有 Istio 时**：每个语言各自实现重试逻辑（Java 用 Resilience4j，Go 手写 retry loop），参数散落各处，全局改超时时间要改 N 个服务。
+
+---
+
+#### 场景 C：熔断 — inventory-service 数据库挂了，快速失败
+
+**背景**：库存服务依赖 MySQL，某天 MySQL 主库宕机，inventory-service 开始大量返回 500。如果不熔断，order-service 的请求会堆积，线程池耗尽，整个下单链路雪崩。
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: inventory-service-dr
+  namespace: prod
+spec:
+  host: inventory-service.prod.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:           # 异常检测（熔断）
+      consecutive5xxErrors: 5   # 连续 5 次 5xx 错误
+      interval: 10s             # 每 10 秒检测一次
+      baseEjectionTime: 30s     # 熔断后 30 秒内不再发请求给它
+      maxEjectionPercent: 50    # 最多熔断 50% 的 Pod
+```
+
+**效果**：inventory-service 连续 5 次 5xx 后，Istio 自动把它踢出负载均衡池。30 秒后试探性地放一个请求过去，如果恢复了就重新加入，没好就继续踢。
+
+**没有 Istio 时**：需要每个调用方都集成熔断库（Hystrix / Sentinel / Resilience4j），Go/Python/Java 各写一套，参数还不统一。
+
+---
+
+### 10.2 安全实战
+
+#### 场景 D：全局 mTLS — 所有服务间通信加密
+
+**背景**：合规要求，所有微服务间通信必须加密，不能明文传输订单数据、用户信息。
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: mtls-strict
+  namespace: prod
+spec:
+  mtls:
+    mode: STRICT        # 强制 mTLS
+```
+
+**效果**：一条命令，prod 命名空间内所有服务间通信自动升级为 mTLS 加密。Istio 自动签发证书、自动轮换（默认 24 小时），无需任何应用代码改动。
+
+**Enovy 代理间通信示例**：
+
+```
+order-service Pod                       payment-service Pod
+┌──────────────┐                       ┌──────────────┐
+│  app 容器     │                       │  app 容器     │
+│  (HTTP 明文)  │                       │  (HTTP 明文)  │
+└──────┬───────┘                       └──────▲───────┘
+       │ localhost:8080                       │ localhost:8080
+┌──────┴───────┐                       ┌──────┴───────┐
+│ Envoy Sidecar│ ◀══ mTLS 加密 ═══▶   │ Envoy Sidecar│
+└──────────────┘                       └──────────────┘
+       应用之间是明文                          应用之间是明文
+       代理之间是密文                          代理之间是密文
+```
+
+**没有 Istio 时**：每个服务各自配置 TLS 证书，证书过期了没人知道，半夜服务突然调不通。
+
+---
+
+#### 场景 E：细粒度授权 — 只允许 frontend 调用 order-service 的创建订单接口
+
+**背景**：安全团队要求：只有 frontend 能调用 order-service 的 `POST /api/orders`（创建订单），其他服务（如后台管理系统）不能直接调订单创建接口。
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: order-service-authz
+  namespace: prod
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/prod/sa/frontend"]  # 只有 frontend 的 ServiceAccount
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/api/orders"]        # 精确到接口
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/orders/*"]      # 查询订单可以是 GET
+  - from:
+    - source:
+        principals: ["cluster.local/ns/prod/sa/order-service"]  # 自己调自己
+    to:
+    - operation:
+        methods: ["GET", "POST"]
+        paths: ["/*"]
+```
+
+**效果**：后台管理系统（admin-service）试图直接调 `POST /api/orders` → 被 Envoy 拦截，返回 403 Forbidden。**授权在 Sidecar 层完成，恶意请求连应用进程都碰不到**。
+
+---
+
+### 10.3 可观测性实战
+
+#### 场景 F：Kiali 拓扑图 — 一眼定位故障
+
+**背景**：运维收到告警「下单成功率下降 30%」，打开 Kiali Dashboard：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Kiali — Service Mesh 拓扑图                              │
+│                                                         │
+│       ┌──────────┐    HTTP/2.0     ┌──────────────┐    │
+│       │ frontend │───────▶────────│order-service │    │
+│       │  ✅ 正常  │  0.5% err      │   ⚠️ 黄色    │    │
+│       └──────────┘                └──┬───┬───┬───┘    │
+│                                      │   │   │         │
+│                           ┌──────────┘   │   └──────┐  │
+│                           ▼               ▼           ▼  │
+│                  ┌──────────────┐ ┌──────────────┐ ┌───┐ │
+│                  │payment-svc   │ │inventory-svc │ │...│ │
+│                  │   ✅ 正常     │ │  ❌ 红色      │ │   │ │
+│                  └──────────────┘ │ 错误率 85%    │ └───┘ │
+│                                   └──────────────┘       │
+│                                                         │
+│  点击 inventory-service → 看到详细指标：                   │
+│  QPS: 1,200 → 340 (骤降)                                │
+│  P99 延迟: 50ms → 8,000ms (暴涨)                         │
+│  错误率: 0.1% → 85%                                     │
+│                                                         │
+│  → 点击链路追踪，跳转到 Jaeger：                           │
+│                                                         │
+│  frontend → order-service → inventory-service            │
+│  总耗时 8.2s                                              │
+│    ├─ frontend: 120ms  ✅                                │
+│    ├─ order-service: 150ms  ✅                           │
+│    └─ inventory-service: 7,900ms  ❌ ← 瓶颈在这里！       │
+│         └─ SQL: SELECT * FROM inventory WHERE ...        │
+│            耗时 7.8s  ← MySQL 慢查询导致！                │
+└─────────────────────────────────────────────────────────┘
+```
+
+**排查路径**：Kiali 看拓扑 → 发现 inventory-service 变红 → 点 Jaeger 看链路 → 发现是 MySQL 慢查询 → 找 DBA 优化索引 → 问题解决。
+
+**没有 Istio 时**：接到告警 → 挨个服务看日志 → 猜是哪个环节慢 → 加日志重新部署 → 再看日志 → 可能半小时过去了还没定位到根因。
+
+---
+
+### 10.4 全部配置汇总
+
+把上面的场景整合到一个目录结构里：
+
+```
+istio-config/
+├── 01-destination-rules.yaml    # 所有服务的版本子集 + 熔断策略
+├── 02-virtual-services.yaml     # 路由规则 + 超时重试 + 金丝雀权重
+├── 03-gateway.yaml              # 入口网关
+├── 04-peer-authentication.yaml  # mTLS 全局策略
+├── 05-authorization-policies.yaml # 各服务的授权策略
+└── 06-observability.yaml        # Kiali/Jaeger 配置（或用 istioctl dashboard）
+```
+
+**一键部署**：
+
+```bash
+kubectl apply -f istio-config/
+```
+
+**验证**：
+
+```bash
+# 查看金丝雀流量分布
+kubectl exec -it deploy/frontend -c istio-proxy -- \
+  pilot-agent request GET stats | grep order-service
+
+# 查看 mTLS 状态
+istioctl experimental authz check order-service-xxx
+
+# 打开 Kiali 面板
+istioctl dashboard kiali
+```
+
+---
+
+### 10.5 这个案例覆盖了哪些 Istio 功能
+
+| 场景 | 功能 | 用到的 CRD | 解决的问题 |
+|------|------|-----------|-----------|
+| A 金丝雀发布 | 流量管理 | VirtualService + DestinationRule | 新版本逐步上线，出问题秒级回滚 |
+| B 超时重试 | 流量管理 | VirtualService | 下游慢不拖垮上游，自动重试提高成功率 |
+| C 熔断 | 流量管理 | DestinationRule | 故障服务自动隔离，防止雪崩 |
+| D 全局 mTLS | 安全 | PeerAuthentication | 零代码实现服务间加密通信 |
+| E 细粒度授权 | 安全 | AuthorizationPolicy | 精确到 HTTP 方法 + 路径的访问控制 |
+| F 可观测性 | 可观测性 | 内置集成 | Kiali 看拓扑 + Jaeger 看链路，分钟级定位故障 |
+
+**一句话总结这个案例**：前端改一行代码都没改，5 个 YAML 文件就把一个裸奔的微服务集群变成了有金丝雀发布、自动熔断、mTLS 加密、权限控制、全局可观测的「企业级」架构。
