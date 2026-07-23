@@ -106,7 +106,7 @@ multipass info dev-vm
 
 # 停止/启动/重启
 multipass stop dev-vm
-yu dev-vm
+yuyu dev-vm
 multipass restart dev-vm
 
 # 暂停/恢复（类似休眠，内存状态保留）
